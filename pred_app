@@ -1,0 +1,122 @@
+import logging
+import os
+import json
+from datetime import datetime, timedelta
+
+import lightgbm as lgb
+import pandas as pd
+import numpy as np
+import requests
+
+import azure.functions as func
+from azure.functions import AuthLevel, HttpRequest, HttpResponse
+from azure.functions.decorators import FunctionApp, route
+
+app = FunctionApp(http_auth_level=AuthLevel.FUNCTION)
+
+
+def fetch_weather_features(date_str):
+    """Open-Meteoから天気データを取得し、特徴量を作成"""
+    latitude, longitude = 35.6812, 139.7671  # 東京駅
+    target_day = pd.to_datetime(date_str).date()
+    today = datetime.now().date()
+
+    if target_day <= today:
+        start_date = (target_day - timedelta(days=10)).isoformat()
+        end_date = target_day.isoformat()
+        api_type = "archive"
+    else:
+        if (target_day - today).days > 15:
+            raise ValueError("未来予測は最大16日先まで対応しています。")
+        start_date = (target_day - timedelta(days=9)).isoformat()
+        end_date = (target_day + timedelta(days=1)).isoformat()
+        api_type = "forecast"
+
+    url = (
+        f"https://api.open-meteo.com/v1/{api_type}"
+        f"?latitude={latitude}&longitude={longitude}"
+        f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
+        f"weather_code,shortwave_radiation_sum"
+        f"&timezone=Asia%2FTokyo"
+        f"&start_date={start_date}&end_date={end_date}"
+    )
+
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception("天気APIの呼び出しに失敗しました。")
+
+    data = response.json()
+    df = pd.DataFrame(data["daily"])
+    df["time"] = pd.to_datetime(df["time"])
+    df.set_index("time", inplace=True)
+
+    if pd.to_datetime(date_str) not in df.index:
+        raise ValueError("対象日の天気データが見つかりません。")
+
+    df["temp_10d_avg"] = df["temperature_2m_mean"].rolling(window=10, min_periods=1).mean()
+    df["temp_diff"] = df["temperature_2m_mean"] - df["temp_10d_avg"]
+    df["weekday"] = df.index.dayofweek
+
+    feature_cols = [
+        "temperature_2m_mean", "precipitation_sum", "wind_speed_10m_mean",
+        "weekday", "temp_diff", "temp_10d_avg", "weather_code", "shortwave_radiation_sum"
+    ]
+
+    return df.loc[[pd.to_datetime(date_str)], feature_cols]
+
+
+def predict_beer_sales(date_obj):
+    """各ビールの販売予測を実施"""
+    feature_df = fetch_weather_features(date_obj.isoformat())
+
+    target_cols = [
+        "ペールエール", "ラガー", "IPA",
+        "ホワイトビール", "黒ビール", "フルーツビール"
+    ]
+
+    predictions = {}
+
+    for col in target_cols:
+        model_filename = f"{col}.txt"
+        model_path = os.path.join(os.path.dirname(__file__), model_filename)
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"モデルファイルが見つかりません: {model_filename}")
+
+        model = lgb.Booster(model_file=model_path)
+        pred = model.predict(feature_df)[0]
+        predictions[col] = round(pred, 2)
+
+    return {
+        "date": date_obj.isoformat(),
+        "predictions": predictions
+    }
+
+
+@app.function_name(name="pred")
+@app.route(route="pred", methods=["GET"])
+def main(req: HttpRequest) -> HttpResponse:
+    logging.info("ビール販売予測APIが呼び出されました。")
+
+    date_str = req.params.get("date")
+    if not date_str:
+        try:
+            req_body = req.get_json()
+            date_str = req_body.get("date")
+        except Exception:
+            return HttpResponse("日付(date)を指定してください。", status_code=400)
+
+    if not date_str:
+        return HttpResponse("日付(date)が見つかりません。", status_code=400)
+
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return HttpResponse("日付形式が正しくありません。YYYY-MM-DD形式で指定してください。", status_code=400)
+
+    try:
+        result = predict_beer_sales(date_obj)
+        return HttpResponse(json.dumps(result, ensure_ascii=False), mimetype="application/json")
+    except Exception as e:
+        logging.error(f"予測エラー: {str(e)}")
+        return HttpResponse(f"予測に失敗しました: {str(e)}", status_code=500)
