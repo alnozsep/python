@@ -1,27 +1,19 @@
-response API
-
 import azure.functions as func
+from azure.functions import FunctionApp
 import logging
 import json
 
-# Azure Functions v2 プログラミングモデルを使用
-app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+app = FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
-@app.route(route="predict", methods=["GET"])
+@app.function_name(name="prediction")
+@app.route(route="prediction", methods=["GET"])
 def predict_beer_sales(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Mock API - ビール売上予測 (簡略版)
-    """
     logging.info('Mock API called')
 
-    # 日付パラメータを取得
     request_date = req.params.get('date')
-    
-    # 日付パラメータがない場合はデフォルト値を使用
     if not request_date:
         request_date = "2025-06-13"
 
-    # 簡略化されたモックデータ
     mock_data = {
         "requested_date": request_date,
         "predictions": [
@@ -35,7 +27,6 @@ def predict_beer_sales(req: func.HttpRequest) -> func.HttpResponse:
         "comment": "Mock API - テストデータ"
     }
 
-    # JSONレスポンスを返却
     return func.HttpResponse(
         json.dumps(mock_data, ensure_ascii=False),
         status_code=200,
