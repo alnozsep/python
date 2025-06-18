@@ -120,3 +120,5 @@ def pred(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"bulk_pred_error: {str(e)}")
         return HttpResponse(f"予測に失敗しました: {str(e)}", status_code=500)
+
+予測に失敗しました: HTTPSConnectionPool(host='forecast-api.open-meteo.com', port=443): Max retries exceeded with url: /v1/forecast?latitude=35.6812&longitude=139.7671&start_date=2025-06-18&end_date=2025-07-04&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,weather_code,shortwave_radiation_sum&timezone=Asia%2FTokyo (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x000001DA733C8990>: Failed to resolve 'forecast-api.open-meteo.com' ([Errno 11001] getaddrinfo failed)"))
