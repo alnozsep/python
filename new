@@ -10,40 +10,67 @@ def fetch_weather_features_bulk():
     from datetime import datetime, timedelta
     import requests
 
-    logging.info("Fetching weather data in bulk")
+    logging.info("Fetching historical and forecast weather data")
+
     latitude, longitude = 35.6812, 139.7671  # 東京駅
     today = datetime.now().date()
-    start_date = today.isoformat()
-    end_date = (today + timedelta(days=16)).isoformat()
 
-    url = (
-        f"https://forecast-api.open-meteo.com/v1/forecast?"
+    # -------- 過去データ (archive-api) --------
+    past_start = (today - timedelta(days=9)).isoformat()
+    past_end = (today - timedelta(days=1)).isoformat()
+
+    archive_url = (
+        f"https://archive-api.open-meteo.com/v1/archive?"
         f"latitude={latitude}&longitude={longitude}"
-        f"&start_date={start_date}&end_date={end_date}"
+        f"&start_date={past_start}&end_date={past_end}"
         f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
         f"weather_code,shortwave_radiation_sum"
         f"&timezone=Asia%2FTokyo"
     )
 
-    response = requests.get(url)
-    if response.status_code != 200:
-        raise Exception("天気APIの呼び出しに失敗しました。")
+    archive_resp = requests.get(archive_url)
+    if archive_resp.status_code != 200:
+        raise Exception("過去天気データの取得に失敗しました。")
+    archive_data = archive_resp.json()["daily"]
+    df_archive = pd.DataFrame(archive_data)
 
-    data = response.json()["daily"]
-    df = pd.DataFrame(data)
-    df["time"] = pd.to_datetime(df["time"])
-    df.set_index("time", inplace=True)
+    # -------- 未来データ (forecast-api) --------
+    future_start = today.isoformat()
+    future_end = (today + timedelta(days=16)).isoformat()
 
-    df["temp_10d_avg"] = df["temperature_2m_mean"].rolling(window=10, min_periods=1).mean()
-    df["temp_diff"] = df["temperature_2m_mean"] - df["temp_10d_avg"]
-    df["weekday"] = df.index.dayofweek
+    forecast_url = (
+        f"https://forecast-api.open-meteo.com/v1/forecast?"
+        f"latitude={latitude}&longitude={longitude}"
+        f"&start_date={future_start}&end_date={future_end}"
+        f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
+        f"weather_code,shortwave_radiation_sum"
+        f"&timezone=Asia%2FTokyo"
+    )
+
+    forecast_resp = requests.get(forecast_url)
+    if forecast_resp.status_code != 200:
+        raise Exception("未来天気データの取得に失敗しました。")
+    forecast_data = forecast_resp.json()["daily"]
+    df_forecast = pd.DataFrame(forecast_data)
+
+    # -------- 結合と前処理 --------
+    df_all = pd.concat([df_archive, df_forecast], ignore_index=True)
+    df_all["time"] = pd.to_datetime(df_all["time"])
+    df_all.set_index("time", inplace=True)
+
+    # 特徴量作成
+    df_all["temp_10d_avg"] = df_all["temperature_2m_mean"].rolling(window=10, min_periods=1).mean()
+    df_all["temp_diff"] = df_all["temperature_2m_mean"] - df_all["temp_10d_avg"]
+    df_all["weekday"] = df_all.index.dayofweek
 
     feature_cols = [
         "temperature_2m_mean", "precipitation_sum", "wind_speed_10m_mean",
         "weekday", "temp_diff", "temp_10d_avg", "weather_code", "shortwave_radiation_sum"
     ]
 
-    return df[feature_cols]
+    # 今日から16日後の範囲のみ返す（過去は特徴量生成用）
+    target_range = (df_all.index.date >= today) & (df_all.index.date <= today + timedelta(days=16))
+    return df_all.loc[target_range, feature_cols]
 
 # -------- ビール販売量の一括予測 --------
 def predict_beer_sales_bulk():
