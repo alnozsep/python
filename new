@@ -14,19 +14,23 @@ def fetch_weather_features_bulk():
 
     latitude, longitude = 35.6812, 139.7671  # 東京駅
     today = datetime.now().date()
+    logging.info(today)
 
     # -------- 過去データ (archive-api) --------
     past_start = (today - timedelta(days=9)).isoformat()
+    logging.info(past_start)
+
     past_end = (today - timedelta(days=1)).isoformat()
+    logging.info(past_end)
 
     archive_url = (
-    f"https://api.open-meteo.com/v1/archive?"
-    f"latitude={latitude}&longitude={longitude}"
-    f"&start_date={start_date}&end_date={end_date}"
-    f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
-    f"weather_code,shortwave_radiation_sum"
-    f"&timezone=Asia%2FTokyo"
-)
+        f"https://archive-api.open-meteo.com/v1/archive?"
+        f"latitude={latitude}&longitude={longitude}"
+        f"&start_date={past_start}&end_date={past_end}"
+        f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
+        f"weather_code,shortwave_radiation_sum"
+        f"&timezone=Asia%2FTokyo"
+        )
 
 
     archive_resp = requests.get(archive_url)
@@ -37,12 +41,12 @@ def fetch_weather_features_bulk():
 
     # -------- 未来データ (forecast-api) --------
     future_start = today.isoformat()
-    future_end = (today + timedelta(days=16)).isoformat()
+    future_end = (today + timedelta(days=15)).isoformat()
 
     forecast_url = (
     f"https://api.open-meteo.com/v1/forecast?"
     f"latitude={latitude}&longitude={longitude}"
-    f"&start_date={start_date}&end_date={end_date}"
+    f"&start_date={future_start}&end_date={future_end}"
     f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
     f"weather_code,shortwave_radiation_sum"
     f"&timezone=Asia%2FTokyo"
@@ -122,5 +126,3 @@ def pred(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"bulk_pred_error: {str(e)}")
         return HttpResponse(f"予測に失敗しました: {str(e)}", status_code=500)
-
-予測に失敗しました: HTTPSConnectionPool(host='forecast-api.open-meteo.com', port=443): Max retries exceeded with url: /v1/forecast?latitude=35.6812&longitude=139.7671&start_date=2025-06-18&end_date=2025-07-04&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,weather_code,shortwave_radiation_sum&timezone=Asia%2FTokyo (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x000001DA733C8990>: Failed to resolve 'forecast-api.open-meteo.com' ([Errno 11001] getaddrinfo failed)"))
