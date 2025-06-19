@@ -3,6 +3,17 @@ from azure.functions import FunctionApp, HttpResponse
 
 app = FunctionApp()
 
+def safe_round(val, digits=2):
+    import math
+    if val is None:
+        return None
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return None
+    try:
+        return round(val, digits)
+    except Exception:
+        return None
+
 # -------- 天気データの一括取得 --------
 def fetch_weather_features_bulk():
     import logging
@@ -116,7 +127,7 @@ def predict_beer_sales_bulk():
         for key in include_weather_keys:
             value = weather_data.get(key)
             if value is not None:
-                day_prediction[key] = round(value, 2) if isinstance(value, (int, float)) else value
+                day_prediction[key] = safe_round(value, 2) if isinstance(value, (int, float)) else value
 
         result.append(day_prediction)
 
