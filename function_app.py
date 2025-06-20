@@ -3,7 +3,7 @@ import os
 import math
 import json
 from datetime import date, timedelta, datetime
-
+features = []
 import azure.functions as func
 from azure.functions import FunctionApp, HttpResponse
 import requests
@@ -12,6 +12,7 @@ import joblib
 import lightgbm as lgb
 import pickle
 import jpholiday
+import numpy as np
 
 app = FunctionApp()
 
@@ -26,15 +27,10 @@ def safe_round(val, digits=2):
         return None
 
 def fetch_weather_features_bulk():
-    import requests
-    import pandas as pd
-    import jpholiday
-    from datetime import datetime, timedelta
-
     latitude, longitude = 35.6895, 139.6917
     today = datetime.now().date()
 
-    past_start = (today - timedelta(days=14)).isoformat()  # 14日前からに拡大
+    past_start = (today - timedelta(days=14)).isoformat()  # 14日前から
     past_end = (today - timedelta(days=1)).isoformat()
 
     archive_url = (
@@ -72,6 +68,16 @@ def fetch_weather_features_bulk():
         f"&timezone=Asia%2FTokyo"
     )
 
+    features += [
+    "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "precipitation_hours",
+    "windspeed_10m_mean", "windspeed_10m_max", "shortwave_radiation_sum",
+    "temp_10d_avg", 
+    "is_weekend", "is_holiday_flag", "is_day_before_holiday",
+    "relative_humidity_2m_max", "relative_humidity_2m_min", "et0_fao_evapotranspiration",
+    "windgusts_10m_max", "weekday", "month", "temp2", "prc2", "temperature_2m_mean", "tempprc", "shiny_holiday",
+    "et02"]
+
+
     forecast_resp = requests.get(forecast_url)
     if forecast_resp.status_code != 200:
         raise Exception("未来天気データの取得に失敗しました。")
@@ -82,116 +88,102 @@ def fetch_weather_features_bulk():
     merged_df["time"] = pd.to_datetime(merged_df["time"])
     merged_df.set_index("time", inplace=True)
 
-    features = []
-
-    # ■ 1日～14日の平均気温との乖離とその差分の2乗列
-    for window_size in range(1, 15):  # 1〜14日間
+        # 移動平均と差分計算（1〜14日）
+    for window_size in range(1, 15):
         col_avg = f"temp_{window_size}d_avg"
         col_diff = f"temp_diff_{window_size}d"
         merged_df[col_avg] = merged_df["temperature_2m_mean"].rolling(window=window_size, min_periods=1).mean()
         merged_df[col_diff] = merged_df["temperature_2m_mean"] - merged_df[col_avg]
-
-    # ■ precipitation_sumの移動平均と差分
+        features.append(col_diff)
+    
+    # 1〜14日の移動平均・差分（降水量）
     for window_size in range(1, 15):
         prec_avg_col = f"precip_{window_size}d_avg"
         prec_diff_col = f"precip_diff_{window_size}d"
         merged_df[prec_avg_col] = merged_df["precipitation_sum"].rolling(window=window_size, min_periods=1).mean()
         merged_df[prec_diff_col] = merged_df["precipitation_sum"] - merged_df[prec_avg_col]
         features.append(prec_diff_col)
-
-    # ■ temperature差分の2乗列
+    
+    # 差分の二乗（気温）
     for window_size in range(1, 15):
         col_diff = f"temp_diff_{window_size}d"
         col_diff_sq = f"{col_diff}_squared"
         merged_df[col_diff_sq] = merged_df[col_diff] ** 2
-
-    # ■ precipitation差分の2乗列
+        features.append(col_diff_sq)
+    
+    # 差分の二乗（降水量）
     for window_size in range(1, 15):
         prec_diff_col = f"precip_diff_{window_size}d"
         prec_diff_sq_col = f"{prec_diff_col}_squared"
         merged_df[prec_diff_sq_col] = merged_df[prec_diff_col] ** 2
         features.append(prec_diff_sq_col)
 
-    # 既存の特徴量も追加
+    # tempprc, temp2, prc2, et02 計算
+    merged_df["tempprc"] = merged_df["temperature_2m_mean"] * merged_df["precipitation_sum"]
+    merged_df["temp2"] = merged_df["temperature_2m_mean"] ** 2
+    merged_df["prc2"] = merged_df["precipitation_sum"] ** 2
+    merged_df["et02"] = merged_df["et0_fao_evapotranspiration"] ** 2
+
     merged_df["weekday"] = merged_df.index.dayofweek
     merged_df["is_weekend"] = (merged_df["weekday"] >= 5).astype(int)
     merged_df["is_newyear"] = ((merged_df.index.month == 12) & (merged_df.index.day == 31)) | \
                              ((merged_df.index.month == 1) & (merged_df.index.day.isin([1, 2, 3])))
     merged_df["is_holiday"] = merged_df.index.to_series().apply(jpholiday.is_holiday)
     merged_df["is_holiday_flag"] = (merged_df["is_weekend"] | merged_df["is_holiday"] | merged_df["is_newyear"]).astype(int)
-
     merged_df["shiny_holiday"] = merged_df["shortwave_radiation_sum"] * merged_df["is_holiday_flag"]
 
-    # 予測範囲を本日から16日先までに絞る
     date_start = datetime.now().date()
     date_end = date_start + timedelta(days=16)
     target_range = (merged_df.index.date >= date_start) & (merged_df.index.date <= date_end)
 
     return merged_df.loc[target_range]
 
+def load_models(target_col):
+    model_dir = os.path.join(os.path.dirname(__file__), f"saved_models/{target_col}")
+    lgb_model_path = os.path.join(model_dir, "lightgbm.txt")
+    lr_model_path = os.path.join(model_dir, "linear_regression.pkl")
+    prophet_model_path = os.path.join(model_dir, "prophet.pkl")
 
+    if not os.path.exists(lgb_model_path) or not os.path.exists(lr_model_path) or not os.path.exists(prophet_model_path):
+        raise FileNotFoundError(f"{target_col} のモデルファイルが不足しています。")
+
+    model_lgb = lgb.Booster(model_file=lgb_model_path)
+    model_lr = joblib.load(lr_model_path)
+    with open(prophet_model_path, "rb") as f:
+        model_prophet = pickle.load(f)
+
+    return model_lgb, model_lr, model_prophet
 
 def predict_beer_sales_bulk():
-    import numpy as np
-    import joblib
-    import lightgbm as lgb
-    import pickle
-    import os
-
     logging.info("Starting bulk prediction")
 
     feature_df_full = fetch_weather_features_bulk()
     target_cols = ["pale_ale", "lager", "ipa", "white", "dark", "fruit"]
     results = []
 
+    # 使用特徴量（モデルに合わせて必要なものをセット）
+    feature_cols = features
+
+    feature_df = feature_df_full.reindex(columns=feature_cols, fill_value=0)
+
     for target_col in target_cols:
-        model_dir = os.path.join(os.path.dirname(__file__), f"saved_models/{target_col}")
-        lgb_model_path = os.path.join(model_dir, "lightgbm.txt")
-        lr_model_path = os.path.join(model_dir, "linear_regression.pkl")
-        prophet_model_path = os.path.join(model_dir, "prophet.pkl")
-        features_path = os.path.join(model_dir, "feature_cols.txt")
-
-        # ファイルチェック
-        missing_files = []
-        for path in [lgb_model_path, lr_model_path, prophet_model_path]:
-            if not os.path.exists(path):
-                missing_files.append(path)
-        if missing_files:
-            raise FileNotFoundError(f"{target_col} のモデルまたは特徴量ファイルが不足しています: {missing_files}")
-
-        feature_cols =[
-        "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "precipitation_hours",
-        "windspeed_10m_mean", "windspeed_10m_max", "shortwave_radiation_sum",
-        "temp_10d_avg", 
-        "is_weekend", "is_holiday_flag", "terrace_removed_flag", "is_day_before_holiday",
-        "relative_humidity_2m_max", "relative_humidity_2m_min", "et0_fao_evapotranspiration",
-        "windgusts_10m_max", "weekday", "month","first_high_wind_hour","temp2","prc2","temperature_2m_mean","tempprc","shiny_holiday",
-        "et02","evening_windspeed_max"
-    ] 
-
-        feature_df = feature_df_full[feature_cols]
+        model_lgb, model_lr, model_prophet = load_models(target_col)
 
         # LightGBM予測
-        model_lgb = lgb.Booster(model_file=lgb_model_path)
         pred_lgb_log = model_lgb.predict(feature_df)
         pred_lgb = np.expm1(pred_lgb_log)
 
         # Linear Regression予測
-        model_lr = joblib.load(lr_model_path)
         pred_lr_log = model_lr.predict(feature_df)
         pred_lr = np.expm1(pred_lr_log)
 
         # Prophet予測
-        from prophet import Prophet
-        model_prophet = None
-        with open(prophet_model_path, "rb") as f:
-            model_prophet = pickle.load(f)
-
         prophet_df = pd.DataFrame({"ds": feature_df_full.index})
         prophet_forecast = model_prophet.predict(prophet_df)
         pred_prophet_log = prophet_forecast["yhat"].values
         pred_prophet = np.expm1(pred_prophet_log)
 
+        # 3モデル平均
         pred_ensemble = (pred_lgb + pred_lr + pred_prophet) / 3
 
         if len(results) == 0:
@@ -219,8 +211,6 @@ def predict_beer_sales_bulk():
 @app.function_name(name="pred")
 @app.route(route="pred", methods=["GET"])
 def pred(req: func.HttpRequest) -> func.HttpResponse:
-    import logging
-    import json
     logging.basicConfig(level=logging.INFO)
     logging.info("beerAPI bulk prediction started")
 
@@ -235,12 +225,6 @@ def pred(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name(name="timer_trigger_weather_to_db")
 @app.schedule(schedule="0 1 * * *", arg_name="mytimer", run_on_startup=False, use_monitor=True)
 def timer_trigger_weather_to_db(mytimer: func.TimerRequest) -> None:
-    import logging
-    import requests
-    import os
-    import psycopg2
-    from datetime import date, timedelta
-
     logging.info('Timer triggered!')
 
     yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -264,6 +248,7 @@ def timer_trigger_weather_to_db(mytimer: func.TimerRequest) -> None:
         return
 
     try:
+        import psycopg2
         conn = psycopg2.connect(os.environ["CONNECTION_STRING"])
         cur = conn.cursor()
 
