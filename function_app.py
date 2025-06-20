@@ -13,7 +13,24 @@ import lightgbm as lgb
 import pickle
 import jpholiday
 import numpy as np
-予測に失敗しました: Can't get attribute 'BaseType' on <module 'cmdstanpy.utils.stancsv' from 'C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\cmdstanpy\\utils\\stancsv.py'
+
+def restore_np_types(obj):
+    if isinstance(obj, dict):
+        return {k: restore_np_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [restore_np_types(i) for i in obj]
+    elif isinstance(obj, int):
+        return np.int64(obj)
+    elif isinstance(obj, float):
+        return np.float64(obj)
+    else:
+        return obj
+
+with open(os.path.join(model_dir, "prophet_model.json"), "r") as f:
+    loaded_json = json.load(f)
+    restored_json = restore_np_types(loaded_json)
+    model_prophet = model_from_json(restored_json)
+
 url = (
     f"https://archive-api.open-meteo.com/v1/archive?"
     f"latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}"
