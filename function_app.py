@@ -1,15 +1,21 @@
 import logging
-import requests
-import psycopg2
-from datetime import date, timedelta, datetime
 import os
+import math
+import json
+from datetime import date, timedelta, datetime
+
 import azure.functions as func
 from azure.functions import FunctionApp, HttpResponse
+import requests
+import pandas as pd
+import joblib
+import lightgbm as lgb
+import pickle
+import jpholiday
 
 app = FunctionApp()
 
 def safe_round(val, digits=2):
-    import math
     if val is None:
         return None
     if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
@@ -19,18 +25,16 @@ def safe_round(val, digits=2):
     except Exception:
         return None
 
-# -------- 天気データの一括取得 --------
 def fetch_weather_features_bulk():
+    import requests
     import pandas as pd
-
-    logging.info("Fetching historical and forecast weather data")
+    import jpholiday
+    from datetime import datetime, timedelta
 
     latitude, longitude = 35.6895, 139.6917
     today = datetime.now().date()
-    logging.info(today)
 
-    # 過去データ
-    past_start = (today - timedelta(days=10)).isoformat()
+    past_start = (today - timedelta(days=14)).isoformat()  # 14日前からに拡大
     past_end = (today - timedelta(days=1)).isoformat()
 
     archive_url = (
@@ -38,12 +42,11 @@ def fetch_weather_features_bulk():
         f"latitude={latitude}&longitude={longitude}"
         f"&start_date={past_start}&end_date={past_end}"
         f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
-        f"weather_code,shortwave_radiation_sum"
-        f"&daily=temperature_2m_max,temperature_2m_min,"
+        f"weather_code,shortwave_radiation_sum,"
+        f"temperature_2m_max,temperature_2m_min,"
         f"precipitation_hours,relative_humidity_2m_max,relative_humidity_2m_min,"
         f"windspeed_10m_max,windspeed_10m_mean,windgusts_10m_max,"
-        f"et0_fao_evapotranspiration,"
-        f"uv_index_max&timezone=Asia%2FTokyo"
+        f"et0_fao_evapotranspiration,uv_index_max"
         f"&timezone=Asia%2FTokyo"
     )
 
@@ -53,21 +56,19 @@ def fetch_weather_features_bulk():
     archive_data = archive_resp.json()["daily"]
     df_archive = pd.DataFrame(archive_data)
 
-    # 未来データ
     future_start = today.isoformat()
     future_end = (today + timedelta(days=8)).isoformat()
 
     forecast_url = (
-        f"https://archive-api.open-meteo.com/v1/archive?"
+        f"https://archive-api.open-meteo.com/v1/forecast?"
         f"latitude={latitude}&longitude={longitude}"
-        f"&start_date={past_start}&end_date={past_end}"
+        f"&start_date={future_start}&end_date={future_end}"
         f"&daily=temperature_2m_mean,precipitation_sum,wind_speed_10m_mean,"
-        f"weather_code,shortwave_radiation_sum"
-        f"&daily=temperature_2m_max,temperature_2m_min,"
+        f"weather_code,shortwave_radiation_sum,"
+        f"temperature_2m_max,temperature_2m_min,"
         f"precipitation_hours,relative_humidity_2m_max,relative_humidity_2m_min,"
         f"windspeed_10m_max,windspeed_10m_mean,windgusts_10m_max,"
-        f"et0_fao_evapotranspiration,"
-        f"uv_index_max&timezone=Asia%2FTokyo"
+        f"et0_fao_evapotranspiration,uv_index_max"
         f"&timezone=Asia%2FTokyo"
     )
 
@@ -77,106 +78,151 @@ def fetch_weather_features_bulk():
     forecast_data = forecast_resp.json()["daily"]
     df_forecast = pd.DataFrame(forecast_data)
 
-    # 結合と前処理
-    
-    df_all = pd.concat([df_archive, df_forecast], ignore_index=True)
-    df_all["time"] = pd.to_datetime(df_all["time"])
-    df_all.set_index("time", inplace=True)
+    merged_df = pd.concat([df_archive, df_forecast], ignore_index=True)
+    merged_df["time"] = pd.to_datetime(merged_df["time"])
+    merged_df.set_index("time", inplace=True)
 
-    df_all["temp_10d_avg"] = df_all["temperature_2m_mean"].rolling(window=10, min_periods=1).mean()
-    df_all["temp_diff"] = df_all["temperature_2m_mean"] - df_all["temp_10d_avg"]
-    df_all["weekday"] = df_all.index.dayofweek
-    # tempprc, temp2, prc2, et02
-    df_all["tempprc"] = df_all["temperature_2m_mean"] * df_all["precipitation_sum"]
-    df_all["temp2"] = df_all["temperature_2m_mean"] ** 2
-    df_all["prc2"] = df_all["precipitation_sum"] ** 2
-    df_all["et02"] = df_all["et0_fao_evapotranspiration"] ** 2  # 要確認: et0 が含まれているか？
-    
-    # shiny_holiday フラグ生成 (休日フラグ × 日射量)
-    # 曜日・休日フラグ
-    df_all["weekday"] = df_all.index.dayofweek
-    df_all["is_weekend"] = df_all["weekday"] >= 5
-    df_all["is_newyear"] = ((df_all.index.month == 12) & (df_all.index.day == 31)) | ((df_all.index.month == 1) & (df_all.index.day.isin([1, 2, 3])))
-    
-    # jpholiday による祝日判定
-    import jpholiday
-    df_all["is_holiday"] = df_all.index.to_series().apply(jpholiday.is_holiday)
-    df_all["is_holiday_flag"] = (df_all["is_weekend"] | df_all["is_holiday"] | df_all["is_newyear"]).astype(int)
+    features = []
 
-# shiny_holiday = 照度 * 休日フラグ
-    df_all["shiny_holiday"] = df_all["shortwave_radiation_sum"] * df_all["is_holiday_flag"]
+    # ■ 1日～14日の平均気温との乖離とその差分の2乗列
+    for window_size in range(1, 15):  # 1〜14日間
+        col_avg = f"temp_{window_size}d_avg"
+        col_diff = f"temp_diff_{window_size}d"
+        merged_df[col_avg] = merged_df["temperature_2m_mean"].rolling(window=window_size, min_periods=1).mean()
+        merged_df[col_diff] = merged_df["temperature_2m_mean"] - merged_df[col_avg]
+
+    # ■ precipitation_sumの移動平均と差分
+    for window_size in range(1, 15):
+        prec_avg_col = f"precip_{window_size}d_avg"
+        prec_diff_col = f"precip_diff_{window_size}d"
+        merged_df[prec_avg_col] = merged_df["precipitation_sum"].rolling(window=window_size, min_periods=1).mean()
+        merged_df[prec_diff_col] = merged_df["precipitation_sum"] - merged_df[prec_avg_col]
+        features.append(prec_diff_col)
+
+    # ■ temperature差分の2乗列
+    for window_size in range(1, 15):
+        col_diff = f"temp_diff_{window_size}d"
+        col_diff_sq = f"{col_diff}_squared"
+        merged_df[col_diff_sq] = merged_df[col_diff] ** 2
+
+    # ■ precipitation差分の2乗列
+    for window_size in range(1, 15):
+        prec_diff_col = f"precip_diff_{window_size}d"
+        prec_diff_sq_col = f"{prec_diff_col}_squared"
+        merged_df[prec_diff_sq_col] = merged_df[prec_diff_col] ** 2
+        features.append(prec_diff_sq_col)
+
+    # 既存の特徴量も追加
+    merged_df["weekday"] = merged_df.index.dayofweek
+    merged_df["is_weekend"] = (merged_df["weekday"] >= 5).astype(int)
+    merged_df["is_newyear"] = ((merged_df.index.month == 12) & (merged_df.index.day == 31)) | \
+                             ((merged_df.index.month == 1) & (merged_df.index.day.isin([1, 2, 3])))
+    merged_df["is_holiday"] = merged_df.index.to_series().apply(jpholiday.is_holiday)
+    merged_df["is_holiday_flag"] = (merged_df["is_weekend"] | merged_df["is_holiday"] | merged_df["is_newyear"]).astype(int)
+
+    merged_df["shiny_holiday"] = merged_df["shortwave_radiation_sum"] * merged_df["is_holiday_flag"]
+
+    # 予測範囲を本日から16日先までに絞る
+    date_start = datetime.now().date()
+    date_end = date_start + timedelta(days=16)
+    target_range = (merged_df.index.date >= date_start) & (merged_df.index.date <= date_end)
+
+    return merged_df.loc[target_range]
 
 
-    target_range = (df_all.index.date >= today) & (df_all.index.date <= today + timedelta(days=16))
-    return df_all.loc[target_range]
 
-# -------- ビール販売量の一括予測 --------
 def predict_beer_sales_bulk():
-    import lightgbm as lgb
-    import pandas as pd
+    import numpy as np
     import joblib
+    import lightgbm as lgb
+    import pickle
+    import os
 
     logging.info("Starting bulk prediction")
 
     feature_df_full = fetch_weather_features_bulk()
-
     target_cols = ["pale_ale", "lager", "ipa", "white", "dark", "fruit"]
-    predictions = {}
+    results = []
 
-    for col in target_cols:
-        model_dir = os.path.join(os.path.dirname(__file__), f"saved_models/{col}")
-        model_path = os.path.join(model_dir, "lightgbm.txt")
-        imputer_path = os.path.join(model_dir, "imputer.pkl")
+    for target_col in target_cols:
+        model_dir = os.path.join(os.path.dirname(__file__), f"saved_models/{target_col}")
+        lgb_model_path = os.path.join(model_dir, "lightgbm.txt")
+        lr_model_path = os.path.join(model_dir, "linear_regression.pkl")
+        prophet_model_path = os.path.join(model_dir, "prophet.pkl")
         features_path = os.path.join(model_dir, "feature_cols.txt")
 
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"モデル {col} のファイルが存在しません")
-        if not os.path.exists(imputer_path) or not os.path.exists(features_path):
-            raise FileNotFoundError(f"{col} 用の前処理ファイルが不足しています")
+        # ファイルチェック
+        missing_files = []
+        for path in [lgb_model_path, lr_model_path, prophet_model_path]:
+            if not os.path.exists(path):
+                missing_files.append(path)
+        if missing_files:
+            raise FileNotFoundError(f"{target_col} のモデルまたは特徴量ファイルが不足しています: {missing_files}")
 
-        # 特徴量読み込み
-        with open(features_path, "r") as f:
-            feature_cols = [line.strip() for line in f.readlines()]
+        feature_cols =[
+        "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "precipitation_hours",
+        "windspeed_10m_mean", "windspeed_10m_max", "shortwave_radiation_sum",
+        "temp_10d_avg", 
+        "is_weekend", "is_holiday_flag", "terrace_removed_flag", "is_day_before_holiday",
+        "relative_humidity_2m_max", "relative_humidity_2m_min", "et0_fao_evapotranspiration",
+        "windgusts_10m_max", "weekday", "month","first_high_wind_hour","temp2","prc2","temperature_2m_mean","tempprc","shiny_holiday",
+        "et02","evening_windspeed_max"
+    ] 
 
-        # 欠損補完
-        imputer = joblib.load(imputer_path)
         feature_df = feature_df_full[feature_cols]
-        feature_df_imputed = pd.DataFrame(imputer.transform(feature_df), columns=feature_cols)
 
-        # モデル読み込みと予測
-        model = lgb.Booster(model_file=model_path)
-        pred_values = model.predict(feature_df_imputed)
-        predictions[col] = [safe_round(p, 2) for p in pred_values]
+        # LightGBM予測
+        model_lgb = lgb.Booster(model_file=lgb_model_path)
+        pred_lgb_log = model_lgb.predict(feature_df)
+        pred_lgb = np.expm1(pred_lgb_log)
 
-    # 出力の構成
-    result = []
-    for i, dt in enumerate(feature_df_full.index):
-        row = {"date": dt.date().isoformat()}
-        for col in target_cols:
-            row[col] = predictions[col][i]
+        # Linear Regression予測
+        model_lr = joblib.load(lr_model_path)
+        pred_lr_log = model_lr.predict(feature_df)
+        pred_lr = np.expm1(pred_lr_log)
 
-        weather_row = feature_df_full.iloc[i].to_dict()
-        include_weather_keys = [
-            "temperature_2m_mean", "temperature_2m_max", "temperature_2m_min",
-            "relative_humidity_2m_max", "relative_humidity_2m_min",
-            "wind_speed_10m_max", "weather_code", "weekday"
-        ]
-        for key in include_weather_keys:
+        # Prophet予測
+        from prophet import Prophet
+        model_prophet = None
+        with open(prophet_model_path, "rb") as f:
+            model_prophet = pickle.load(f)
+
+        prophet_df = pd.DataFrame({"ds": feature_df_full.index})
+        prophet_forecast = model_prophet.predict(prophet_df)
+        pred_prophet_log = prophet_forecast["yhat"].values
+        pred_prophet = np.expm1(pred_prophet_log)
+
+        pred_ensemble = (pred_lgb + pred_lr + pred_prophet) / 3
+
+        if len(results) == 0:
+            for dt in feature_df_full.index:
+                results.append({"date": dt.date().isoformat()})
+
+        for idx in range(len(feature_df_full)):
+            results[idx][target_col] = safe_round(pred_ensemble[idx], 2)
+
+    weather_keys = [
+        "temperature_2m_mean", "temperature_2m_max", "temperature_2m_min",
+        "relative_humidity_2m_max", "relative_humidity_2m_min",
+        "wind_speed_10m_max", "weather_code", "weekday"
+    ]
+
+    for idx, dt in enumerate(feature_df_full.index):
+        weather_row = feature_df_full.iloc[idx]
+        for key in weather_keys:
             val = weather_row.get(key)
-            row[key] = safe_round(val, 2) if isinstance(val, (int, float)) else val
+            results[idx][key] = safe_round(val, 2) if isinstance(val, (int, float)) else val
 
-        result.append(row)
-
-    return result
+    return results
 
 
-# -------- HTTPルート関数 (GET) --------
 @app.function_name(name="pred")
 @app.route(route="pred", methods=["GET"])
 def pred(req: func.HttpRequest) -> func.HttpResponse:
+    import logging
     import json
     logging.basicConfig(level=logging.INFO)
-    logging.info("beerAPI bulk prediction has started")
+    logging.info("beerAPI bulk prediction started")
 
     try:
         results = predict_beer_sales_bulk()
@@ -185,10 +231,16 @@ def pred(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"bulk_pred_error: {str(e)}")
         return HttpResponse(f"予測に失敗しました: {str(e)}", status_code=500)
 
-# -------- タイマートリガーでDBへ天気保存 --------
+
 @app.function_name(name="timer_trigger_weather_to_db")
 @app.schedule(schedule="0 1 * * *", arg_name="mytimer", run_on_startup=False, use_monitor=True)
 def timer_trigger_weather_to_db(mytimer: func.TimerRequest) -> None:
+    import logging
+    import requests
+    import os
+    import psycopg2
+    from datetime import date, timedelta
+
     logging.info('Timer triggered!')
 
     yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -212,36 +264,36 @@ def timer_trigger_weather_to_db(mytimer: func.TimerRequest) -> None:
         return
 
     try:
-        conn = psycopg2.connect(
-            host=os.environ["DB_HOST"],
-            dbname=os.environ["DB_NAME"],
-            user=os.environ["DB_USER"],
-            password=os.environ["DB_PASSWORD"],
-            port="5432"
-        )
+        conn = psycopg2.connect(os.environ["CONNECTION_STRING"])
         cur = conn.cursor()
 
-        cur.execute("""
-            INSERT INTO sales_weather (
-                date, weather_code_id, temperature_max, temperature_min,
-                temperature_mean, windspeed_max, humidity_max, humidity_min,
-                created_at, updated_at, is_deleted
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), false)
-            ON CONFLICT (date) DO NOTHING;
-        """, (
-            yesterday,
-            data["weathercode"][0],
-            data["temperature_2m_max"][0],
-            data["temperature_2m_min"][0],
-            data["temperature_2m_mean"][0],
-            data["windspeed_10m_max"][0],
-            data["humidity_2m_max"][0],
-            data["humidity_2m_min"][0]
-        ))
+        weather_code = data["weathercode"][0]
+        temp_max = data["temperature_2m_max"][0]
+        temp_min = data["temperature_2m_min"][0]
+        temp_mean = data["temperature_2m_mean"][0]
+        wind_max = data["windspeed_10m_max"][0]
+        hum_max = data["humidity_2m_max"][0]
+        hum_min = data["humidity_2m_min"][0]
 
+        cur.execute(
+            """
+            INSERT INTO weathercode(date, weathercode, temperature_2m_max, temperature_2m_min,
+            temperature_2m_mean, windspeed_10m_max, humidity_2m_max, humidity_2m_min)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (date) DO UPDATE SET
+            weathercode=EXCLUDED.weathercode,
+            temperature_2m_max=EXCLUDED.temperature_2m_max,
+            temperature_2m_min=EXCLUDED.temperature_2m_min,
+            temperature_2m_mean=EXCLUDED.temperature_2m_mean,
+            windspeed_10m_max=EXCLUDED.windspeed_10m_max,
+            humidity_2m_max=EXCLUDED.humidity_2m_max,
+            humidity_2m_min=EXCLUDED.humidity_2m_min;
+            """,
+            (yesterday, weather_code, temp_max, temp_min, temp_mean, wind_max, hum_max, hum_min)
+        )
         conn.commit()
         cur.close()
         conn.close()
-        logging.info("✅ 天気データの登録完了")
+        logging.info("天気データをDBに保存しました。")
     except Exception as e:
-        logging.error(f"❌ データベース処理エラー: {e}")
+        logging.error(f"DB保存エラー: {str(e)}")
