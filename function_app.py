@@ -88,35 +88,31 @@ def fetch_weather_features_bulk():
     merged_df["time"] = pd.to_datetime(merged_df["time"])
     merged_df.set_index("time", inplace=True)
 
-        # 移動平均と差分計算（1〜14日）
-    for window_size in range(1, 15):
+    # ■ 平均気温との乖離
+    for window_size in range(1, 15):  # 1日から14日まで
         col_avg = f"temp_{window_size}d_avg"
         col_diff = f"temp_diff_{window_size}d"
         merged_df[col_avg] = merged_df["temperature_2m_mean"].rolling(window=window_size, min_periods=1).mean()
         merged_df[col_diff] = merged_df["temperature_2m_mean"] - merged_df[col_avg]
-        features.append(col_diff)
     
-    # 1〜14日の移動平均・差分（降水量）
+    # precipitation_sumの移動平均と差分
     for window_size in range(1, 15):
         prec_avg_col = f"precip_{window_size}d_avg"
         prec_diff_col = f"precip_diff_{window_size}d"
         merged_df[prec_avg_col] = merged_df["precipitation_sum"].rolling(window=window_size, min_periods=1).mean()
         merged_df[prec_diff_col] = merged_df["precipitation_sum"] - merged_df[prec_avg_col]
         features.append(prec_diff_col)
-    
-    # 差分の二乗（気温）
-    for window_size in range(1, 15):
+        
+    for window_size in range(1, 15):  # temperature差分の2乗列
         col_diff = f"temp_diff_{window_size}d"
         col_diff_sq = f"{col_diff}_squared"
         merged_df[col_diff_sq] = merged_df[col_diff] ** 2
-        features.append(col_diff_sq)
     
-    # 差分の二乗（降水量）
-    for window_size in range(1, 15):
+    for window_size in range(1, 15):  # precipitation差分の2乗列
         prec_diff_col = f"precip_diff_{window_size}d"
         prec_diff_sq_col = f"{prec_diff_col}_squared"
         merged_df[prec_diff_sq_col] = merged_df[prec_diff_col] ** 2
-        features.append(prec_diff_sq_col)
+        features.append(prec_diff_sq_col)  # 必要ならfeaturesにも追加
 
     # tempprc, temp2, prc2, et02 計算
     merged_df["tempprc"] = merged_df["temperature_2m_mean"] * merged_df["precipitation_sum"]
@@ -131,6 +127,10 @@ def fetch_weather_features_bulk():
     merged_df["is_holiday"] = merged_df.index.to_series().apply(jpholiday.is_holiday)
     merged_df["is_holiday_flag"] = (merged_df["is_weekend"] | merged_df["is_holiday"] | merged_df["is_newyear"]).astype(int)
     merged_df["shiny_holiday"] = merged_df["shortwave_radiation_sum"] * merged_df["is_holiday_flag"]
+    for window_size in range(1, 15):
+    col_diff = f"temp_diff_{window_size}d"
+    features.append(col_diff)
+
 
     date_start = datetime.now().date()
     date_end = date_start + timedelta(days=16)
