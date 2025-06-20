@@ -13,6 +13,17 @@ import lightgbm as lgb
 import pickle
 import jpholiday
 import numpy as np
+
+url = (
+    f"https://archive-api.open-meteo.com/v1/archive?"
+    f"latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}"
+    f"&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,"
+    f"precipitation_sum,precipitation_hours,relative_humidity_2m_max,relative_humidity_2m_min,"
+    f"windspeed_10m_max,windspeed_10m_mean,windgusts_10m_max,"
+    f"shortwave_radiation_sum,et0_fao_evapotranspiration,"
+    f"sunset,"
+    f"uv_index_max&timezone=Asia%2FTokyo"
+)
 features = [
     "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "precipitation_hours",
     "windspeed_10m_mean", "windspeed_10m_max", "shortwave_radiation_sum",
