@@ -13,7 +13,15 @@ import lightgbm as lgb
 import pickle
 import jpholiday
 import numpy as np
-
+features = [
+    "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "precipitation_hours",
+    "windspeed_10m_mean", "windspeed_10m_max", "shortwave_radiation_sum",
+    "temp_10d_avg", 
+    "is_weekend", "is_holiday_flag", "is_day_before_holiday",
+    "relative_humidity_2m_max", "relative_humidity_2m_min", "et0_fao_evapotranspiration",
+    "windgusts_10m_max", "weekday", "month","temp2","prc2","temperature_2m_mean","tempprc","shiny_holiday",
+    "et02"
+] 
 app = FunctionApp()
 
 def safe_round(val, digits=2):
