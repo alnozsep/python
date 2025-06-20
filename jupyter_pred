@@ -1,0 +1,335 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests
+import jpholiday
+from datetime import timedelta
+import lightgbm as lgb
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+features = [
+    "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "precipitation_hours",
+    "windspeed_10m_mean", "windspeed_10m_max", "shortwave_radiation_sum",
+    "temp_10d_avg", 
+    "is_weekend", "is_holiday_flag", "is_day_before_holiday",
+    "relative_humidity_2m_max", "relative_humidity_2m_min", "et0_fao_evapotranspiration",
+    "windgusts_10m_max", "weekday", "month","temp2","prc2","temperature_2m_mean","tempprc","shiny_holiday",
+    "et02"
+] 
+# ■ フォント設定（macOS 向け）
+plt.rcParams["font.family"] = "Hiragino Sans"
+plt.rcParams["axes.unicode_minus"] = False
+
+# ■ データ読み込み
+df = pd.read_csv("/Users/nozakizai/Documents/クラフトビール専門店_売上データ_2024年4月-2025年4月 (曜日ありデータ).csv")  # パスを適宜変更
+df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
+
+# ■ 売上列整形
+numeric_cols = [col for col in df.columns if "(円)" in col or "(本)" in col]
+for col in numeric_cols:
+    df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
+
+# ■ 日付情報
+df["weekday"] = df["日付"].dt.day_name()
+df["month"] = df["日付"].dt.month_name()
+
+
+# -------------------------------
+# ■ 天気データ取得（Open-Meteo API）
+# -------------------------------
+lat, lon = 35.6895, 139.6917
+start_date = df["日付"].min().strftime("%Y-%m-%d")
+end_date = df["日付"].max().strftime("%Y-%m-%d")
+
+url = (
+    f"https://archive-api.open-meteo.com/v1/archive?"
+    f"latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}"
+    f"&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,"
+    f"precipitation_sum,precipitation_hours,relative_humidity_2m_max,relative_humidity_2m_min,"
+    f"windspeed_10m_max,windspeed_10m_mean,windgusts_10m_max,"
+    f"shortwave_radiation_sum,et0_fao_evapotranspiration,"
+    f"sunset,"
+    f"uv_index_max&timezone=Asia%2FTokyo"
+)
+weather_df = pd.DataFrame(requests.get(url).json()["daily"])
+weather_df["日付"] = pd.to_datetime(weather_df["time"])
+
+# ■ ビールの列定義
+beer_columns = ["ペールエール(本)", "ラガー(本)", "IPA(本)", "ホワイトビール(本)", "黒ビール(本)", "フルーツビール(本)"]
+beer_prices = ["ペールエール(円)", "ラガー(円)", "IPA(円)", "ホワイトビール(円)", "黒ビール(円)", "フルーツビール(円)","総杯数","売上合計(円)","来客数"]
+for col in beer_columns:
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+# ■ 売上と天気をマージ
+merged_df = pd.merge(df, weather_df, on="日付", how="inner")
+merged_df["weekday"] = merged_df["日付"].dt.weekday
+merged_df["month"] = merged_df["日付"].dt.month
+
+
+merged_df["tempprc"] = merged_df["temperature_2m_mean"]*merged_df["precipitation_sum"]
+merged_df["temp2"] = merged_df["temperature_2m_mean"]*merged_df["temperature_2m_mean"]
+merged_df["prc2"] = merged_df["precipitation_sum"]*merged_df["precipitation_sum"]
+merged_df["et02"] = merged_df["et0_fao_evapotranspiration"]*merged_df["et0_fao_evapotranspiration"]
+
+# ■ 平均気温との乖離
+for window_size in range(1, 15):  # 1日から14日まで
+    col_avg = f"temp_{window_size}d_avg"
+    col_diff = f"temp_diff_{window_size}d"
+    merged_df[col_avg] = merged_df["temperature_2m_mean"].rolling(window=window_size, min_periods=1).mean()
+    merged_df[col_diff] = merged_df["temperature_2m_mean"] - merged_df[col_avg]
+
+# precipitation_sumの移動平均と差分
+for window_size in range(1, 15):
+    prec_avg_col = f"precip_{window_size}d_avg"
+    prec_diff_col = f"precip_diff_{window_size}d"
+    merged_df[prec_avg_col] = merged_df["precipitation_sum"].rolling(window=window_size, min_periods=1).mean()
+    merged_df[prec_diff_col] = merged_df["precipitation_sum"] - merged_df[prec_avg_col]
+    features.append(prec_diff_col)
+    
+for window_size in range(1, 15):  # temperature差分の2乗列
+    col_diff = f"temp_diff_{window_size}d"
+    col_diff_sq = f"{col_diff}_squared"
+    merged_df[col_diff_sq] = merged_df[col_diff] ** 2
+
+for window_size in range(1, 15):  # precipitation差分の2乗列
+    prec_diff_col = f"precip_diff_{window_size}d"
+    prec_diff_sq_col = f"{prec_diff_col}_squared"
+    merged_df[prec_diff_sq_col] = merged_df[prec_diff_col] ** 2
+    features.append(prec_diff_sq_col)  # 必要ならfeaturesにも追加
+
+
+
+
+# ■ フラグ系（休日、風強、前日休日）
+merged_df["is_holiday"] = merged_df["日付"].apply(jpholiday.is_holiday)
+merged_df["is_weekend"] = merged_df["日付"].dt.weekday >= 5
+merged_df["is_newyear"] = merged_df["日付"].apply(lambda d: (d.month == 12 and d.day == 31) or (d.month == 1 and d.day in [1,2,3]))
+merged_df["is_holiday_flag"] = merged_df[["is_holiday", "is_weekend", "is_newyear"]].any(axis=1).astype(int)
+
+def is_day_before_holiday(date):
+    next_day = date + timedelta(days=1)
+    return jpholiday.is_holiday(next_day) or next_day.weekday() >= 5 or (next_day.month == 12 and next_day.day == 31)
+
+merged_df["is_day_before_holiday"] = merged_df["日付"].apply(is_day_before_holiday).astype(int)
+
+# 論理値を整数に変換
+bool_cols = merged_df.select_dtypes(include="bool").columns
+merged_df[bool_cols] = merged_df[bool_cols].astype(int)
+merged_df["shiny_holiday"]=merged_df["is_holiday_flag"]* merged_df["shortwave_radiation_sum"]
+# -------------------------------
+# ■ 特徴量リスト（明示）
+# -------------------------------
+
+# 1〜14日の差分列名を作ってfeaturesに追加
+for window_size in range(1, 15):
+    col_diff = f"temp_diff_{window_size}d"
+    features.append(col_diff)
+
+# -------------------------------
+# ✅ 出力確認
+# -------------------------------
+print(merged_df[["日付"] + features].head())
+
+
+# 全列名を表示
+for col in merged_df.columns:
+    print(col)
+
+print(merged_df["windspeed_10m_mean"])
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import lightgbm as lgb
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from prophet import Prophet
+from sklearn.impute import SimpleImputer
+import joblib
+import json
+import pickle
+import os
+import optuna
+from prophet.serialize import model_to_json
+
+with open('serialized_model.json', 'w') as fout:
+    json.dump(model_to_json(model_prophet), fout)
+
+
+# 使用する目的変数（日本語）
+target_cols = ["ペールエール(本)", "ラガー(本)", "IPA(本)", "ホワイトビール(本)", "黒ビール(本)", "フルーツビール(本)"]
+
+# 日本語→英語の変換辞書（保存フォルダ名に使用）
+beer_name_map = {
+    "ペールエール(本)": "pale_ale",
+    "ラガー(本)": "lager",
+    "IPA(本)": "ipa",
+    "ホワイトビール(本)": "whitebeer",
+    "黒ビール(本)": "dark",
+    "フルーツビール(本)": "fruit"
+}
+
+# 使用する列（featuresは定義済みの前提）
+used_columns = features + target_cols + ["日付"]
+merged_df = merged_df[used_columns]
+
+# Train/test 分割
+train_end = int(len(merged_df) * 0.85)
+
+# アンサンブル用のシード
+num_seeds = 10
+seeds = [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
+
+# 目的変数ループ
+for target_col in target_cols:
+    print("=" * 70)
+    print(f"🎯 目的変数: {target_col}")
+    
+    # 保存用ディレクトリ作成
+    beer_name_en = beer_name_map[target_col]
+    model_dir = os.path.join("ultra_models", beer_name_en)
+    os.makedirs(model_dir, exist_ok=True)
+
+    # データ抽出
+    y = merged_df[target_col]
+    all_feature_cols = features
+    y_log = np.log1p(y)
+
+    X_train = merged_df.iloc[:train_end][all_feature_cols]
+    y_train_log = y_log.iloc[:train_end]
+
+    X_test = merged_df.iloc[train_end:][all_feature_cols]
+    y_test_log = y_log.iloc[train_end:]
+    y_test_original = y.iloc[train_end:]
+    date_test = merged_df.iloc[train_end:]["日付"]
+
+    # 欠損補完
+    imputer = SimpleImputer(strategy="median")
+    X_train_imputed = pd.DataFrame(imputer.fit_transform(X_train), columns=X_train.columns)
+    X_test_imputed = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
+
+    # Optuna で LightGBM のパラメータ探索
+    def objective(trial):
+        params = {
+            "objective": "regression",
+            "metric": "rmse",
+            "boosting_type": "gbdt",
+            "learning_rate": trial.suggest_loguniform("learning_rate", 0.005, 0.1),
+            "num_leaves": trial.suggest_int("num_leaves", 20, 100),
+            "max_depth": trial.suggest_int("max_depth", 3, 15),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 10, 100),
+            "feature_fraction": trial.suggest_uniform("feature_fraction", 0.6, 1.0),
+            "bagging_fraction": trial.suggest_uniform("bagging_fraction", 0.6, 1.0),
+            "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
+            "lambda_l1": trial.suggest_loguniform("lambda_l1", 1e-8, 10.0),
+            "lambda_l2": trial.suggest_loguniform("lambda_l2", 1e-8, 10.0),
+            "verbosity": -1,
+            "seed": 42,
+        }
+        lgb_train = lgb.Dataset(X_train_imputed, label=y_train_log)
+        gbm = lgb.train(params, lgb_train, num_boost_round=1000, valid_sets=[lgb_train])
+        y_pred = gbm.predict(X_test_imputed)
+        rmse = np.sqrt(mean_squared_error(y_test_log, y_pred))
+        return rmse
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=100, show_progress_bar=True)
+
+    best_params = study.best_params
+    print(f"✨ Best params: {best_params}")
+    print(f"✨ Best RMSE: {study.best_value:.4f}")
+
+    # LightGBM 学習・保存（複数シード）
+    lgb_preds = []
+    for seed in seeds:
+        best_params["seed"] = seed
+        lgb_train = lgb.Dataset(X_train_imputed, label=y_train_log)
+        model_lgb = lgb.train(best_params, lgb_train, num_boost_round=1000, valid_sets=[lgb_train])
+        y_pred_lgb_log = model_lgb.predict(X_test_imputed)
+        y_pred_lgb = np.expm1(y_pred_lgb_log)
+        lgb_preds.append(y_pred_lgb)
+        joblib.dump(model_lgb, os.path.join(model_dir, f"lgb_seed_{seed}.pkl"))
+
+    y_pred_lgb_ensemble = np.mean(lgb_preds, axis=0)
+
+    # 線形回帰モデル
+    model_lr = LinearRegression()
+    model_lr.fit(X_train_imputed, y_train_log)
+    y_pred_lr_log = model_lr.predict(X_test_imputed)
+    y_pred_lr = np.expm1(y_pred_lr_log)
+    joblib.dump(model_lr, os.path.join(model_dir, "linear_model.pkl"))
+
+    # Prophet モデル
+# 学習データの準備
+    prophet_df = pd.DataFrame({"ds": merged_df["日付"][:train_end], "y": y_train_log})
+
+    # モデル作成と学習
+    model_prophet = Prophet()
+    model_prophet.fit(prophet_df)
+    # 予測対象日付のDataFrame作成
+    future_df = pd.DataFrame({"ds": date_test})
+    prophet_forecast = model_prophet.predict(future_df)
+
+    # 予測結果を変換
+    y_pred_prophet_log = prophet_forecast["yhat"].values
+    y_pred_prophet = np.expm1(y_pred_prophet_log)
+
+    import numpy as np
+
+
+    def convert_np_types(obj):
+        if isinstance(obj, dict):
+            return {k: convert_np_types(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_np_types(i) for i in obj]
+        elif isinstance(obj, (np.integer,)):
+            return int(obj)
+        elif isinstance(obj, (np.floating,)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
+
+    # モデル保存（NumPy型を回避して保存）
+    with open(os.path.join(model_dir, "prophet_model.json"), "w") as f:
+        json.dump(convert_np_types(model_to_json(model_prophet)), f)
+
+
+    # 単純平均アンサンブル
+    y_pred_ensemble = (y_pred_lgb_ensemble + y_pred_lr + y_pred_prophet) / 3
+
+    # スコア
+    rmse_test = np.sqrt(mean_squared_error(y_test_original, y_pred_ensemble))
+    r2_test = r2_score(y_test_original, y_pred_ensemble)
+    mae_test = mean_absolute_error(y_test_original, y_pred_ensemble)
+    print(f"✅ [TEST-Ensemble] RMSE: {rmse_test:.2f} / R²: {r2_test:.3f} / MAE: {mae_test:.2f}")
+
+    # 特徴量重要度（最後のLightGBM）
+    importance = model_lgb.feature_importance(importance_type="gain")
+    feature_names = model_lgb.feature_name()
+    importance_df = pd.DataFrame({"feature": feature_names, "importance": importance}).sort_values(by="importance", ascending=False)
+    print("▶️ 特徴量重要度（Gain順）")
+    print(importance_df)
+
+    # 可視化（トップ20特徴量）
+    top_n = 20
+    plt.figure(figsize=(8, 6))
+    plt.barh(importance_df["feature"].head(top_n)[::-1], importance_df["importance"].head(top_n)[::-1], color="skyblue")
+    plt.title(f"Feature Importance for {target_col}")
+    plt.xlabel("Gain Importance")
+    plt.tight_layout()
+    plt.show()
+
+    # 週単位評価
+    date_test = pd.to_datetime(date_test)
+    weekly_df = pd.DataFrame({"date": date_test, "actual": y_test_original.values, "predicted": y_pred_ensemble})
+    weekly_df["week_start"] = weekly_df["date"] - pd.to_timedelta(weekly_df["date"].dt.weekday, unit='d')
+    weekly_summary = weekly_df.groupby("week_start")[["actual", "predicted"]].sum().reset_index()
+    weekly_rmse = np.sqrt(mean_squared_error(weekly_summary["actual"], weekly_summary["predicted"]))
+    weekly_r2 = r2_score(weekly_summary["actual"], weekly_summary["predicted"])
+    weekly_mae = mean_absolute_error(weekly_summary["actual"], weekly_summary["predicted"])
+    print(f"📅 [TEST-Ensemble / Weekly Sum] RMSE: {weekly_rmse:.2f} / R²: {weekly_r2:.3f} / MAE: {weekly_mae:.2f}")
+
+
+
