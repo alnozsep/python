@@ -13,7 +13,7 @@ import lightgbm as lgb
 import pickle
 import jpholiday
 import numpy as np
-
+予測に失敗しました: Can't get attribute 'BaseType' on <module 'cmdstanpy.utils.stancsv' from 'C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\cmdstanpy\\utils\\stancsv.py'
 url = (
     f"https://archive-api.open-meteo.com/v1/archive?"
     f"latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}"
